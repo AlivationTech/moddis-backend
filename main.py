@@ -1,349 +1,150 @@
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+import asyncio
+import logging
+import os
+from secrets import compare_digest
+
+from fastapi import FastAPI, Header, HTTPException, Query, Response
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, Field
+
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:
+    load_dotenv = None
+
+if load_dotenv is not None:
+    load_dotenv()
+
+from linkedin_scraper import LinkedInScrapeError, LinkedInScraper
+from mongo_store import LinkedInJobStore, LinkedInPostStore, MongoStoreError
+
+DEFAULT_LINKEDIN_COMPANY_POSTS_URL = "https://www.linkedin.com/company/moddis-resources/posts/"
+DEFAULT_LINKEDIN_REFRESH_MAX_POSTS = 10
+WEBSITE_URL = "https://moddisresources.com"
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s [%(name)s] %(message)s", )
+logger = logging.getLogger("moddis.backend")
 
 
-app = FastAPI(
-    title="Vercel + FastAPI",
-    description="Vercel + FastAPI",
-    version="1.0.0",
-)
+class StoredLinkedInPost(BaseModel):
+    company_url: str
+    post_id: str
+    text: str
+    url: str
+    published_at: str | None = None
+    author_name: str | None = None
+    image_urls: list[str] = Field(default_factory=list)
+    source: str | None = None
+    scraped_at: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
 
 
-@app.get("/api/data")
-def get_sample_data():
-    return {
-        "data": [
-            {"id": 1, "name": "Sample Item 1", "value": 100},
-            {"id": 2, "name": "Sample Item 2", "value": 200},
-            {"id": 3, "name": "Sample Item 3", "value": 300}
-        ],
-        "total": 3,
-        "timestamp": "2024-01-01T00:00:00Z"
-    }
+class StoredLinkedInPostsResponse(BaseModel):
+    company_url: str
+    post_count: int
+    posts: list[StoredLinkedInPost]
 
 
-@app.get("/api/items/{item_id}")
-def get_item(item_id: int):
-    return {
-        "item": {
-            "id": item_id,
-            "name": "Sample Item " + str(item_id),
-            "value": item_id * 100
-        },
-        "timestamp": "2024-01-01T00:00:00Z"
-    }
+class StoredLinkedInJob(BaseModel):
+    company_url: str
+    job_id: str
+    title: str
+    location: str | None = None
+    description: str | None = None
+    apply_email: str | None = None
+    company_name: str | None = None
+    applicant_count: str | None = None
+    published_at: str | None = None
+    url: str | None = None
+    image_urls: list[str] = Field(default_factory=list)
+    employment_type: str | None = None
+    seniority_level: str | None = None
+    job_function: str | None = None
+    industries: str | None = None
+    source: str | None = None
+    source_post_id: str | None = None
+    source_post_url: str | None = None
+    scraped_at: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
 
 
-@app.get("/", response_class=HTMLResponse)
-def read_root():
-    return """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Vercel + FastAPI</title>
-        <link rel="icon" type="image/x-icon" href="/favicon.ico">
-        <style>
-            * {
-                margin: 0;
-                padding: 0;
-                box-sizing: border-box;
-            }
+class StoredLinkedInJobsResponse(BaseModel):
+    company_url: str
+    job_count: int
+    jobs: list[StoredLinkedInJob]
 
-            body {
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', sans-serif;
-                background-color: #000000;
-                color: #ffffff;
-                line-height: 1.6;
-                min-height: 100vh;
-                display: flex;
-                flex-direction: column;
-            }
 
-            header {
-                border-bottom: 1px solid #333333;
-                padding: 0;
-            }
+app = FastAPI(title="Moddis Backend", description="Minimal FastAPI backend for storing and serving scraped LinkedIn posts and jobs.", version="1.0.0", docs_url=None, redoc_url=None)
+scraper = LinkedInScraper(cache_ttl_seconds=int(os.getenv("LINKEDIN_CACHE_TTL_SECONDS", "900")), timeout_seconds=int(os.getenv("LINKEDIN_REQUEST_TIMEOUT_SECONDS", "20")), )
+post_store = LinkedInPostStore()
+job_store = LinkedInJobStore()
 
-            nav {
-                max-width: 1200px;
-                margin: 0 auto;
-                display: flex;
-                align-items: center;
-                padding: 1rem 2rem;
-                gap: 2rem;
-            }
 
-            .logo {
-                font-size: 1.25rem;
-                font-weight: 600;
-                color: #ffffff;
-                text-decoration: none;
-            }
+def is_cron_request(authorization: str | None, x_vercel_cron: str | None) -> bool:
+    cron_secret = os.getenv("CRON_SECRET")
+    if cron_secret and authorization:
+        return compare_digest(authorization, f"Bearer {cron_secret}")
+    return bool(x_vercel_cron)
 
-            .nav-links {
-                display: flex;
-                gap: 1.5rem;
-                margin-left: auto;
-            }
 
-            .nav-links a {
-                text-decoration: none;
-                color: #888888;
-                padding: 0.5rem 1rem;
-                border-radius: 6px;
-                transition: all 0.2s ease;
-                font-size: 0.875rem;
-                font-weight: 500;
-            }
+async def refresh_linkedin_content(company_url: str, max_posts: int) -> None:
+    posts_payload = await asyncio.to_thread(scraper.get_company_posts, company_url, max_posts, True, )
+    posts_storage = await asyncio.to_thread(post_store.save_posts, posts_payload["company_url"], posts_payload["posts"], posts_payload["fetched_at"], )
+    jobs_payload = await asyncio.to_thread(scraper.get_company_jobs, posts_payload["company_url"], max_posts, True, )
+    jobs_storage = await asyncio.to_thread(job_store.save_jobs, jobs_payload["company_url"], jobs_payload["jobs"], jobs_payload["fetched_at"], )
+    logger.info("LinkedIn refresh completed: posts=%s posts_inserted=%s posts_updated=%s jobs=%s jobs_inserted=%s jobs_updated=%s", posts_payload["post_count"], posts_storage["inserted"], posts_storage["updated"], jobs_payload["job_count"], jobs_storage["inserted"], jobs_storage["updated"], )
 
-            .nav-links a:hover {
-                color: #ffffff;
-                background-color: #111111;
-            }
 
-            main {
-                flex: 1;
-                max-width: 1200px;
-                margin: 0 auto;
-                padding: 4rem 2rem;
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                text-align: center;
-            }
+@app.get("/", include_in_schema=False)
+async def read_root() -> RedirectResponse:
+    return RedirectResponse(url=WEBSITE_URL, status_code=307)
 
-            .hero {
-                margin-bottom: 3rem;
-            }
 
-            .hero-code {
-                margin-top: 2rem;
-                width: 100%;
-                max-width: 900px;
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            }
+@app.post("/api/internal/linkedin-refresh", status_code=204, response_model=None)
+async def run_linkedin_refresh(authorization: str | None = Header(default=None), x_vercel_cron: str | None = Header(default=None, alias="x-vercel-cron"), company_url: str = Query(default=os.getenv("LINKEDIN_COMPANY_POSTS_URL", DEFAULT_LINKEDIN_COMPANY_POSTS_URL)),
+        max_posts: int = Query(default=DEFAULT_LINKEDIN_REFRESH_MAX_POSTS, ge=1, le=25), ) -> Response:
+    if not is_cron_request(authorization, x_vercel_cron):
+        raise HTTPException(status_code=403, detail="Not authorized to run refresh.")
+    if not post_store.enabled or not job_store.enabled:
+        raise HTTPException(status_code=503, detail="MongoDB is not configured.")
 
-            .hero-code pre {
-                background-color: #0a0a0a;
-                border: 1px solid #333333;
-                border-radius: 8px;
-                padding: 1.5rem;
-                text-align: left;
-                grid-column: 1 / -1;
-            }
+    try:
+        await refresh_linkedin_content(company_url=company_url, max_posts=max_posts)
+    except LinkedInScrapeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except MongoStoreError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-            h1 {
-                font-size: 3rem;
-                font-weight: 700;
-                margin-bottom: 1rem;
-                background: linear-gradient(to right, #ffffff, #888888);
-                -webkit-background-clip: text;
-                -webkit-text-fill-color: transparent;
-                background-clip: text;
-            }
+    return Response(status_code=204)
 
-            .subtitle {
-                font-size: 1.25rem;
-                color: #888888;
-                margin-bottom: 2rem;
-                max-width: 600px;
-            }
 
-            .cards {
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-                gap: 1.5rem;
-                width: 100%;
-                max-width: 900px;
-            }
+@app.get("/api/linkedin/posts", response_model=StoredLinkedInPostsResponse)
+async def get_stored_linkedin_posts(company_url: str = Query(default=os.getenv("LINKEDIN_COMPANY_POSTS_URL", DEFAULT_LINKEDIN_COMPANY_POSTS_URL), description="LinkedIn company URL whose stored posts should be returned.", ),
+        limit: int = Query(default=10, ge=1, le=50), ) -> StoredLinkedInPostsResponse:
+    canonical_company_url = scraper._build_guest_company_url(company_url)
+    try:
+        posts = post_store.get_posts(company_url=canonical_company_url, limit=limit)
+    except MongoStoreError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-            .card {
-                background-color: #111111;
-                border: 1px solid #333333;
-                border-radius: 8px;
-                padding: 1.5rem;
-                transition: all 0.2s ease;
-                text-align: left;
-            }
+    return StoredLinkedInPostsResponse(company_url=canonical_company_url, post_count=len(posts), posts=[StoredLinkedInPost.model_validate(post) for post in posts], )
 
-            .card:hover {
-                border-color: #555555;
-                transform: translateY(-2px);
-            }
 
-            .card h3 {
-                font-size: 1.125rem;
-                font-weight: 600;
-                margin-bottom: 0.5rem;
-                color: #ffffff;
-            }
+@app.get("/api/linkedin/jobs", response_model=StoredLinkedInJobsResponse)
+async def get_stored_linkedin_jobs(company_url: str = Query(default=os.getenv("LINKEDIN_COMPANY_POSTS_URL", DEFAULT_LINKEDIN_COMPANY_POSTS_URL), description="LinkedIn company URL whose stored jobs should be returned.", ),
+        limit: int = Query(default=10, ge=1, le=50), ) -> StoredLinkedInJobsResponse:
+    canonical_company_url = scraper._build_guest_company_url(company_url)
+    try:
+        jobs = job_store.get_jobs(company_url=canonical_company_url, limit=limit)
+    except MongoStoreError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-            .card p {
-                color: #888888;
-                font-size: 0.875rem;
-                margin-bottom: 1rem;
-            }
-
-            .card a {
-                display: inline-flex;
-                align-items: center;
-                color: #ffffff;
-                text-decoration: none;
-                font-size: 0.875rem;
-                font-weight: 500;
-                padding: 0.5rem 1rem;
-                background-color: #222222;
-                border-radius: 6px;
-                border: 1px solid #333333;
-                transition: all 0.2s ease;
-            }
-
-            .card a:hover {
-                background-color: #333333;
-                border-color: #555555;
-            }
-
-            .status-badge {
-                display: inline-flex;
-                align-items: center;
-                gap: 0.5rem;
-                background-color: #0070f3;
-                color: #ffffff;
-                padding: 0.25rem 0.75rem;
-                border-radius: 20px;
-                font-size: 0.75rem;
-                font-weight: 500;
-                margin-bottom: 2rem;
-            }
-
-            .status-dot {
-                width: 6px;
-                height: 6px;
-                background-color: #00ff88;
-                border-radius: 50%;
-            }
-
-            pre {
-                background-color: #0a0a0a;
-                border: 1px solid #333333;
-                border-radius: 6px;
-                padding: 1rem;
-                overflow-x: auto;
-                margin: 0;
-            }
-
-            code {
-                font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
-                font-size: 0.85rem;
-                line-height: 1.5;
-                color: #ffffff;
-            }
-
-            /* Syntax highlighting */
-            .keyword {
-                color: #ff79c6;
-            }
-
-            .string {
-                color: #f1fa8c;
-            }
-
-            .function {
-                color: #50fa7b;
-            }
-
-            .class {
-                color: #8be9fd;
-            }
-
-            .module {
-                color: #8be9fd;
-            }
-
-            .variable {
-                color: #f8f8f2;
-            }
-
-            .decorator {
-                color: #ffb86c;
-            }
-
-            @media (max-width: 768px) {
-                nav {
-                    padding: 1rem;
-                    flex-direction: column;
-                    gap: 1rem;
-                }
-
-                .nav-links {
-                    margin-left: 0;
-                }
-
-                main {
-                    padding: 2rem 1rem;
-                }
-
-                h1 {
-                    font-size: 2rem;
-                }
-
-                .hero-code {
-                    grid-template-columns: 1fr;
-                }
-
-                .cards {
-                    grid-template-columns: 1fr;
-                }
-            }
-        </style>
-    </head>
-    <body>
-        <header>
-            <nav>
-                <a href="/" class="logo">Vercel + FastAPI</a>
-                <div class="nav-links">
-                    <a href="/docs">API Docs</a>
-                    <a href="/api/data">API</a>
-                </div>
-            </nav>
-        </header>
-        <main>
-            <div class="hero">
-                <h1>Vercel + FastAPI</h1>
-                <div class="hero-code">
-                    <pre><code><span class="keyword">from</span> <span class="module">fastapi</span> <span class="keyword">import</span> <span class="class">FastAPI</span>
-
-<span class="variable">app</span> = <span class="class">FastAPI</span>()
-
-<span class="decorator">@app.get</span>(<span class="string">"/"</span>)
-<span class="keyword">def</span> <span class="function">read_root</span>():
-    <span class="keyword">return</span> {<span class="string">"Python"</span>: <span class="string">"on Vercel"</span>}</code></pre>
-                </div>
-            </div>
-
-            <div class="cards">
-                <div class="card">
-                    <h3>Interactive API Docs</h3>
-                    <p>Explore this API's endpoints with the interactive Swagger UI. Test requests and view response schemas in real-time.</p>
-                    <a href="/docs">Open Swagger UI →</a>
-                </div>
-
-                <div class="card">
-                    <h3>Sample Data</h3>
-                    <p>Access sample JSON data through our REST API. Perfect for testing and development purposes.</p>
-                    <a href="/api/data">Get Data →</a>
-                </div>
-
-            </div>
-        </main>
-    </body>
-    </html>
-    """
+    return StoredLinkedInJobsResponse(company_url=canonical_company_url, job_count=len(jobs), jobs=[StoredLinkedInJob.model_validate(job) for job in jobs], )
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("main:app", host="0.0.0.0", port=5001, reload=True)

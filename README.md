@@ -1,51 +1,27 @@
-# FastAPI Starter
+# Moddis Backend
 
-Deploy your [FastAPI](https://fastapi.tiangolo.com/) project to Vercel with zero configuration.
+Minimal Vercel-friendly FastAPI backend for Moddis Resources.
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/vercel/vercel/tree/main/examples/fastapi&template=fastapi)
+## Endpoints
 
-_Live Example: https://vercel-plus-fastapi.vercel.app/_
+- `GET /` redirects to `https://moddisresources.com`
+- `POST /api/internal/linkedin-refresh`
+- `GET /api/linkedin/posts`
+- `GET /api/linkedin/jobs`
 
-Visit the [FastAPI documentation](https://fastapi.tiangolo.com/) to learn more.
+## Environment Variables
 
-## Getting Started
+- `MONGODB_URL`
+- `MONGODB_DB_NAME`
+- `MONGODB_LINKEDIN_COLLECTION`
+- `MONGODB_LINKEDIN_JOBS_COLLECTION`
+- `LINKEDIN_COMPANY_POSTS_URL`
+- `LINKEDIN_CACHE_TTL_SECONDS`
+- `LINKEDIN_REQUEST_TIMEOUT_SECONDS`
+- `LINKEDIN_REFRESH_MAX_POSTS`
+- `CRON_SECRET`
 
-Install the required dependencies:
+## Notes
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install .
-```
-
-Or, if using [uv](https://docs.astral.sh/uv/):
-
-```bash
-uv sync
-```
-
-
-## Running Locally
-
-Start the development server on http://0.0.0.0:5001
-
-```bash
-python main.py
-# using uv:
-uv run main.py
-```
-
-When you make changes to your project, the server will automatically reload.
-
-## Deploying to Vercel
-
-Deploy your project to Vercel with the following command:
-
-```bash
-npm install -g vercel
-vercel --prod
-```
-
-Or `git push` to your repository with our [git integration](https://vercel.com/docs/deployments/git).
-
-To view the source code for this template, [visit the example repository](https://github.com/vercel/vercel/tree/main/examples/fastapi).
+- `POST /api/internal/linkedin-refresh` returns `204 No Content` after the refresh runs.
+- `vercel.json` still points the Vercel cron job at `/api/internal/linkedin-refresh`.
